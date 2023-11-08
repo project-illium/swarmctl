@@ -17,6 +17,9 @@ type opts struct {
 }
 
 func main() {
+	if err := SetLimits(); err != nil {
+		log.Fatal(err)
+	}
 	o := opts{}
 	parser := flags.NewParser(&o, flags.HelpFlag)
 	_, err := parser.Parse()

@@ -6,7 +6,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"github.com/multiformats/go-multiaddr"
 	manet "github.com/multiformats/go-multiaddr/net"
 	"github.com/project-illium/ilxd/repo"
@@ -63,10 +62,24 @@ func run(config *SwarmConfig, done chan struct{}) {
 
 	amts := distributeStakes(totalCoins, len(config.Nodes))
 
+	sub, err := genesisWalletClient.SubscribeWalletTransactions(context.Background(), &pb.SubscribeWalletTransactionsRequest{})
+	if err != nil {
+		log.Errorf("Error subscribing to wallet tx stream: %s", err)
+		return
+	}
+	txidCh := make(chan *txidSub)
+	go listenSubscription(sub, txidCh, done)
+
 	i := 0
 	go func() {
 		start := time.Now()
-		workTicker := time.NewTicker(time.Minute / time.Duration(config.TxPerMinute))
+		interval := config.TxPerMinute / 10
+		currentInterval := interval
+
+		log.Infof("Transactions per second: %.2f", float64(currentInterval)/60)
+
+		workTicker := time.NewTicker(time.Minute / time.Duration(currentInterval))
+		incrementTicker := time.NewTicker(time.Minute)
 		printTicker := time.NewTicker(time.Minute)
 		for {
 			select {
@@ -74,11 +87,6 @@ func run(config *SwarmConfig, done chan struct{}) {
 				return
 			case addr := <-addrChan:
 				if i >= len(config.Nodes) {
-					continue
-				}
-				sub, err := genesisWalletClient.SubscribeWalletTransactions(context.Background(), &pb.SubscribeWalletTransactionsRequest{})
-				if err != nil {
-					log.Errorf("Error subscribing to block stream: %s", err)
 					continue
 				}
 				resp, err := genesisWalletClient.Spend(context.Background(), &pb.SpendRequest{
@@ -90,8 +98,16 @@ func run(config *SwarmConfig, done chan struct{}) {
 					continue
 				}
 
-				if err := waitForFinalization(sub, types.NewID(resp.Transaction_ID), done); err != nil {
-					log.Errorf("Sending initial coins failed: %s", err)
+				respCh := make(chan struct{})
+				txidCh <- &txidSub{
+					txid: types.NewID(resp.Transaction_ID),
+					resp: respCh,
+				}
+
+				select {
+				case <-time.After(time.Second * 10):
+					log.Error("Timed out waiting for initial tx finalization")
+				case <-respCh:
 				}
 				i++
 			case <-workTicker.C:
@@ -100,6 +116,15 @@ func run(config *SwarmConfig, done chan struct{}) {
 				}
 				r := rand.Intn(len(config.Nodes))
 				workChans[r] <- struct{}{}
+			case <-incrementTicker.C:
+				if currentInterval >= config.TxPerMinute {
+					continue
+				}
+				workTicker.Stop()
+				currentInterval += interval
+				workTicker = time.NewTicker(time.Minute / time.Duration(currentInterval))
+				log.Infof("Transactions per second: %.2f", float64(currentInterval)/60)
+
 			case <-printTicker.C:
 				m := make(map[uint32]int)
 				for _, c := range chainClients {
@@ -126,15 +151,24 @@ func worker(walletClient pb.WalletServiceClient, addrChan chan string, workChan 
 	}
 	sub, err := walletClient.SubscribeWalletTransactions(context.Background(), &pb.SubscribeWalletTransactionsRequest{})
 	if err != nil {
-		log.Errorf("Error fetching wallet address: %s", err)
+		log.Errorf("Error subscribing to block stream: %s", err)
 		return
 	}
+	txidCh := make(chan *txidSub)
+	go listenSubscription(sub, txidCh, done)
 
 	addrChan <- resp.Address
 
-	if err := waitForFinalization(sub, types.ID{}, done); err != nil {
-		log.Errorf("Error receiving initial coins: %s", err)
-		return
+	respCh := make(chan struct{})
+	txidCh <- &txidSub{
+		txid: types.ID{},
+		resp: respCh,
+	}
+
+	select {
+	case <-time.After(time.Second * 10):
+		log.Error("Timed out waiting for spending money tx finalization")
+	case <-respCh:
 	}
 
 	sub, err = walletClient.SubscribeWalletTransactions(context.Background(), &pb.SubscribeWalletTransactionsRequest{})
@@ -148,9 +182,16 @@ func worker(walletClient pb.WalletServiceClient, addrChan chan string, workChan 
 		Amount:    spendingMoney,
 	})
 
-	if err := waitForFinalization(sub, types.NewID(spendResp.Transaction_ID), done); err != nil {
-		log.Errorf("Sending initial coins failed: %s", err)
-		return
+	respCh = make(chan struct{})
+	txidCh <- &txidSub{
+		txid: types.NewID(spendResp.Transaction_ID),
+		resp: respCh,
+	}
+
+	select {
+	case <-time.After(time.Second * 10):
+		log.Error("Timed out waiting for spending money tx finalization")
+	case <-respCh:
 	}
 
 	utxoResp, err := walletClient.GetUtxos(context.Background(), &pb.GetUtxosRequest{})
@@ -178,29 +219,47 @@ func worker(walletClient pb.WalletServiceClient, addrChan chan string, workChan 
 		case <-done:
 			return
 		case <-workChan:
-			sub, err = walletClient.SubscribeWalletTransactions(context.Background(), &pb.SubscribeWalletTransactionsRequest{})
-			if err != nil {
-				log.Errorf("Error subscribing to block stream: %s", err)
-				return
+			out := make(chan struct{})
+			go func() {
+				defer close(out)
+				spendResp, err = walletClient.Spend(context.Background(), &pb.SpendRequest{
+					ToAddress: resp.Address,
+					Amount:    0,
+				})
+				if err != nil {
+					log.Errorf("Error sending spend tx: %s", err)
+				}
+			}()
+			select {
+			case <-time.After(time.Second * 10):
+				log.Errorf("Spend timed out")
+			case <-out:
 			}
-			spendResp, err = walletClient.Spend(context.Background(), &pb.SpendRequest{
-				ToAddress: resp.Address,
-				Amount:    0,
-			})
 
-			if err := waitForFinalization(sub, types.NewID(spendResp.Transaction_ID), done); err != nil {
-				log.Errorf("Sending initial coins failed: %s", err)
-				return
+			respCh := make(chan struct{})
+			txidCh <- &txidSub{
+				txid: types.NewID(spendResp.Transaction_ID),
+				resp: respCh,
+			}
+
+			select {
+			case <-time.After(time.Second * 10):
+				log.Error("Timed out waiting for tx finalization")
+			case <-respCh:
 			}
 		}
 	}
 }
 
-func waitForFinalization(sub pb.WalletService_SubscribeWalletTransactionsClient, txid types.ID, done chan struct{}) error {
-	out := make(chan error)
-	defer close(out)
-	defer sub.CloseSend()
+type txidSub struct {
+	txid types.ID
+	resp chan struct{}
+}
 
+func listenSubscription(sub pb.WalletService_SubscribeWalletTransactionsClient, subChan chan *txidSub, done chan struct{}) {
+	m := make(map[types.ID]chan struct{})
+
+	ch := make(chan *pb.WalletTransactionNotification)
 	go func() {
 		for {
 			select {
@@ -210,24 +269,28 @@ func waitForFinalization(sub pb.WalletService_SubscribeWalletTransactionsClient,
 			}
 			notif, err := sub.Recv()
 			if err != nil {
-				out <- err
+				log.Errorf("Error listing on wallet sub stream: %s", err)
 				return
 			}
-			id := types.NewID(notif.Transaction.Transaction_ID)
-			if id.Compare(txid) == 0 || txid.Compare(types.ID{}) == 0 {
-				out <- nil
-				return
-			}
+			ch <- notif
 		}
 	}()
 
-	select {
-	case <-done:
-		return nil
-	case err := <-out:
-		return err
-	case <-time.After(time.Second * 5):
-		return errors.New("timed out waiting for tx validation")
+	for {
+		select {
+		case <-done:
+			return
+		case sub := <-subChan:
+			m[sub.txid] = sub.resp
+		case notif := <-ch:
+			for txid, resp := range m {
+				id := types.NewID(notif.Transaction.Transaction_ID)
+				if id.Compare(txid) == 0 || txid.Compare(types.ID{}) == 0 {
+					resp <- struct{}{}
+				}
+				delete(m, txid)
+			}
+		}
 	}
 }
 
